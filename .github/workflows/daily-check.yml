@@ -1,0 +1,44 @@
+name: 🔍 Daily Website Health Check
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # 08:00 MEZ / 09:00 MESZ
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL überschreiben (optional)'
+        required: false
+        default: ''
+
+jobs:
+  website-health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Dependencies installieren
+        run: pip install -r requirements.txt
+
+      - name: Website Health Check
+        env:
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          TARGET_URL:         ${{ inputs.target_url || secrets.TARGET_URL }}
+          PAGESPEED_API_KEY:  ${{ secrets.PAGESPEED_API_KEY }}
+          SAVE_REPORT:        'true'
+        run: python agent.py
+
+      - name: Report speichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-report-${{ github.run_id }}
+          path: report_*.json
+          retention-days: 90
