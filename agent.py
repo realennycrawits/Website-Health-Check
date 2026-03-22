@@ -135,23 +135,80 @@ def check_robots_and_sitemap(base_url, session):
     root = f"{parsed.scheme}://{parsed.netloc}"
     result = {}
     sitemap_url = f"{root}/sitemap.xml"
+
+    # ── robots.txt ────────────────────────────────────────────────────────────
     try:
         r = session.get(f"{root}/robots.txt", timeout=10)
-        result["robots_txt"] = {"accessible": r.status_code == 200, "blocks_all": "Disallow: /" in r.text}
-        sm = re.search(r"(?i)Sitemap:\s*(.+)", r.text)
+        text = r.text
+
+        # Exakter Check: blockiert nur wenn "Disallow: /" als eigene Zeile
+        # vorkommt – nicht wenn nur /wp-admin/ o.ä. disallowed ist
+        blocks_all = False
+        has_wildcard = False
+        for line in text.splitlines():
+            line = line.strip()
+            if line.lower().startswith("user-agent:") and line.split(":",1)[1].strip() == "*":
+                has_wildcard = True
+            if has_wildcard and line.lower() == "disallow: /":
+                blocks_all = True
+                break
+            # Neuer User-Agent-Block → wildcard zurücksetzen
+            if line.lower().startswith("user-agent:") and line.split(":",1)[1].strip() != "*":
+                has_wildcard = False
+
+        sm = re.search(r"(?i)Sitemap:\s*(.+)", text)
         if sm: sitemap_url = sm.group(1).strip()
+
+        result["robots_txt"] = {
+            "accessible": r.status_code == 200,
+            "blocks_all": blocks_all,
+        }
     except:
         result["robots_txt"] = {"accessible": False}
+
+    # ── Sitemap ───────────────────────────────────────────────────────────────
     try:
         r = session.get(sitemap_url, timeout=10)
-        result["sitemap"] = {"accessible": r.status_code == 200, "url_count": len(re.findall(r"<loc>", r.text))}
+        sitemap_text = r.text if r.status_code == 200 else ""
+        is_index = "<sitemapindex" in sitemap_text
+
+        if is_index:
+            # Sitemap-Index: enthält Verweise auf weitere Sitemaps
+            # → alle Sub-Sitemaps abrufen und URLs zusammenzählen
+            sub_urls = re.findall(r"<loc>\s*(.*?)\s*</loc>", sitemap_text)
+            total_urls = 0
+            sub_sitemaps_checked = 0
+            for sub_url in sub_urls[:10]:  # max 10 Sub-Sitemaps abrufen
+                try:
+                    rs = session.get(sub_url.strip(), timeout=10)
+                    total_urls += len(re.findall(r"<loc>", rs.text))
+                    sub_sitemaps_checked += 1
+                except:
+                    pass
+            result["sitemap"] = {
+                "accessible": True,
+                "is_index": True,
+                "sub_sitemaps": len(sub_urls),
+                "sub_sitemaps_checked": sub_sitemaps_checked,
+                "url_count": total_urls,
+            }
+        else:
+            url_count = len(re.findall(r"<loc>", sitemap_text))
+            result["sitemap"] = {
+                "accessible": r.status_code == 200,
+                "is_index": False,
+                "url_count": url_count,
+            }
     except:
         result["sitemap"] = {"accessible": False}
+
+    # ── Favicon ───────────────────────────────────────────────────────────────
     try:
         r = session.get(f"{root}/favicon.ico", timeout=8)
         result["favicon"] = {"accessible": r.status_code == 200}
     except:
         result["favicon"] = {"accessible": False}
+
     return result
 
 
