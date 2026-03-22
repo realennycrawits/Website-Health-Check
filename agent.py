@@ -1,6 +1,7 @@
 """
-Website Health Monitor — Multi-Site, CSV-Export für Broken Links
-Slack bekommt nur die kompakte Zusammenfassung + Link zur CSV in GitHub Actions.
+Website Health Monitor — Multi-Site
+- HEAD → GET Fallback bei 403/405 (keine False Positives)
+- Alle Listen > 5 Einträge → eigene CSV-Datei als GitHub Artifact
 """
 
 import os, time, json, ssl, socket, re, csv
@@ -22,11 +23,51 @@ GITHUB_RUN_URL    = (
     f"actions/runs/{os.environ.get('GITHUB_RUN_ID','')}"
 )
 
-MAX_PAGES      = 60
-SLOW_PAGE_MS   = 3000
+MAX_PAGES       = 60
+SLOW_PAGE_MS    = 3000
 REQUEST_TIMEOUT = 15
-CRAWL_DELAY    = 0.5
-SSL_WARN_DAYS  = 30
+CRAWL_DELAY     = 0.5
+SSL_WARN_DAYS   = 30
+CSV_THRESHOLD   = 5   # Ab dieser Anzahl → CSV statt Slack-Text
+
+
+# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
+
+def safe_head_get(session, url, timeout=8):
+    """
+    Prüft den HTTP-Status einer Ressource (wird nur für Bilder verwendet).
+    Strategie: HEAD zuerst → bei 403/405 nochmal mit GET (verhindert False Positives).
+    Gibt (status_code, error_string) zurück.
+    """
+    try:
+        r = session.head(url, timeout=timeout, allow_redirects=True)
+        # Manche Server blockieren HEAD → nochmal mit GET versuchen
+        if r.status_code in (403, 405):
+            try:
+                r2 = session.get(url, timeout=timeout, allow_redirects=True, stream=True)
+                r2.close()  # Body nicht laden
+                return r2.status_code, None
+            except Exception:
+                pass  # HEAD-Ergebnis behalten
+        return r.status_code, None
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except requests.exceptions.ConnectionError:
+        return None, "connection_error"
+    except Exception as e:
+        return None, str(e)
+
+
+def write_csv(filename, rows, fieldnames):
+    """Schreibt eine CSV-Datei und gibt den Dateinamen zurück."""
+    if not rows:
+        return None
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"   💾 {filename} ({len(rows)} Einträge)")
+    return filename
 
 
 # ── Checks ────────────────────────────────────────────────────────────────────
@@ -52,8 +93,10 @@ def check_security_headers(url, session):
         resp = session.get(url, timeout=10)
         h = {k.lower(): v for k, v in resp.headers.items()}
         for hdr in HDRS:
-            (present if h.get(hdr.lower()) else missing).append(hdr) if h.get(hdr.lower()) else missing.append(hdr)
-            if h.get(hdr.lower()): present[hdr] = h[hdr.lower()][:80]
+            if h.get(hdr.lower()):
+                present[hdr] = h[hdr.lower()][:80]
+            else:
+                missing.append(hdr)
     except Exception as e:
         return {"error": str(e), "missing": [], "present": {}, "score": 0, "max": 6}
     return {"missing": missing, "present": present, "score": len(present), "max": len(HDRS)}
@@ -141,18 +184,21 @@ def crawl_website(base_url, session):
         time.sleep(CRAWL_DELAY)
 
         if resp is None:
-            res["errors"].append({"url": url}); continue
+            res["errors"].append({"url": url, "fehler": "timeout/connection"}); continue
 
         status = resp.status_code
         pi = {"status": status, "load_ms": ms, "title": None, "meta_desc": None}
 
         if len(resp.history) > 1:
-            res["redirect_chains"].append({"url": url, "final_url": resp.url, "hops": len(resp.history)})
+            res["redirect_chains"].append({
+                "url": url, "final_url": resp.url,
+                "hops": len(resp.history), "zwischenstopps": " → ".join(r.url for r in resp.history)
+            })
         if status >= 400:
-            res["broken_links"].append({"source": "direkt", "url": url, "status": status})
+            res["broken_links"].append({"url": url, "status": status, "gefunden_auf": "direkt"})
             res["pages"][url] = pi; continue
         if ms > SLOW_PAGE_MS:
-            res["slow_pages"].append({"url": url, "load_ms": ms})
+            res["slow_pages"].append({"url": url, "ladezeit_ms": ms})
 
         try:
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -168,63 +214,138 @@ def crawl_website(base_url, session):
         missing = []
         if not title: missing.append("title")
         if not desc:  missing.append("meta_description")
-        if missing: res["missing_meta"].append({"url": url, "missing": missing})
+        if missing: res["missing_meta"].append({"url": url, "fehlt": ", ".join(missing)})
         if title: res["duplicate_titles"][title].append(url)
         if desc:  res["duplicate_descs"][desc].append(url)
 
         h1s = soup.find_all("h1")
-        if not h1s: res["missing_h1"].append(url)
-        elif len(h1s) > 1: res["multiple_h1"].append({"url": url, "count": len(h1s)})
+        if not h1s:
+            res["missing_h1"].append({"url": url})
+        elif len(h1s) > 1:
+            res["multiple_h1"].append({"url": url, "anzahl_h1": len(h1s), "texte": " | ".join(h.get_text(strip=True)[:50] for h in h1s)})
 
-        if not soup.find("link", rel="canonical"): res["missing_canonical"].append(url)
+        if not soup.find("link", rel="canonical"):
+            res["missing_canonical"].append({"url": url})
 
         rm = soup.find("meta", attrs={"name": "robots"})
-        if rm and "noindex" in rm.get("content","").lower(): res["noindex_pages"].append(url)
+        if rm and "noindex" in rm.get("content","").lower():
+            res["noindex_pages"].append({"url": url, "robots_content": rm.get("content","")})
 
         og_miss = [t for t in ["og:title","og:description","og:image"] if not soup.find("meta", property=t)]
-        if og_miss: res["missing_og_tags"].append({"url": url, "missing": og_miss})
-        if not soup.find_all("script", type="application/ld+json"): res["missing_schema"].append(url)
+        if og_miss: res["missing_og_tags"].append({"url": url, "fehlt": ", ".join(og_miss)})
+
+        if not soup.find_all("script", type="application/ld+json"):
+            res["missing_schema"].append({"url": url})
 
         if url.startswith("https://"):
             for tag, attr in [("img","src"),("script","src"),("link","href"),("iframe","src")]:
                 for el in soup.find_all(tag):
                     v = el.get(attr,"")
-                    if v.startswith("http://"): res["mixed_content"].append({"page": url, "resource": v[:100]})
+                    if v.startswith("http://"):
+                        res["mixed_content"].append({"seite": url, "ressource": v[:120], "typ": tag})
 
         res["pages"][url] = pi
 
-        seen_ext = set()
+        # ── Nur interne Links crawlen – externe werden ignoriert ──
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if not href or href.startswith(("#","mailto:","tel:","javascript:")): continue
             abs_url = urljoin(url, href)
             p = urlparse(abs_url)
-            if p.netloc == domain:
-                if abs_url not in visited: to_visit.append(abs_url)
-            elif p.netloc and abs_url not in seen_ext:
-                seen_ext.add(abs_url)
-                try:
-                    r2 = session.head(abs_url, timeout=8, allow_redirects=True)
-                    if r2.status_code >= 400:
-                        res["broken_links"].append({"source": url, "url": abs_url, "status": r2.status_code})
-                except:
-                    res["broken_links"].append({"source": url, "url": abs_url, "status": "nicht erreichbar"})
-                time.sleep(0.2)
+            if p.netloc == domain and abs_url not in visited:
+                to_visit.append(abs_url)
 
+        # ── Bilder prüfen ──────────────────────────────────────────────────────
+        # Kritisch:    defekte Bilder (404, timeout, kein src)
+        # Informativ:  kein alt-Text, kein width/height, kein lazy loading,
+        #              schlechtes Format (kein WebP/AVIF), zu große Dateigröße (>300KB)
         for img in soup.find_all("img"):
-            src = img.get("src","").strip()
-            alt = img.get("alt","").strip()
+            src     = img.get("src","").strip()
+            alt     = img.get("alt","").strip()
+            width   = img.get("width","").strip()
+            height  = img.get("height","").strip()
+            loading = img.get("loading","").strip().lower()
+
             if not src:
-                res["missing_images"].append({"page": url, "src": "(kein src)", "issue": "fehlendes src"}); continue
+                res["missing_images"].append({
+                    "seite": url, "src": "(kein src)",
+                    "problem": "fehlendes src-Attribut",
+                    "schwere": "kritisch", "alt_text": "",
+                    "dateigroesse_kb": "", "format": "", "hinweis": ""
+                })
+                continue
+
             abs_src = urljoin(url, src)
             if abs_src.startswith("data:"): continue
+
+            # HTTP-Status + Dateigröße in einem Request
+            dateigroesse_kb = ""
+            format_ext = abs_src.split("?")[0].rsplit(".",1)[-1].lower() if "." in abs_src else ""
             try:
-                r2 = session.head(abs_src, timeout=8, allow_redirects=True)
-                if r2.status_code >= 400:
-                    res["missing_images"].append({"page": url, "src": abs_src, "issue": f"HTTP {r2.status_code}"})
-            except:
-                res["missing_images"].append({"page": url, "src": abs_src, "issue": "nicht erreichbar"})
-            if not alt: res["missing_images"].append({"page": url, "src": abs_src, "issue": "kein alt-Text"})
+                r_img = session.head(abs_src, timeout=8, allow_redirects=True)
+                # HEAD → GET Fallback bei 403/405
+                if r_img.status_code in (403, 405):
+                    r_img = session.get(abs_src, timeout=8, allow_redirects=True, stream=True)
+                    r_img.close()
+                status_img = r_img.status_code
+                # Dateigröße aus Content-Length Header lesen (kein extra Request nötig)
+                cl = r_img.headers.get("content-length")
+                if cl and cl.isdigit():
+                    dateigroesse_kb = round(int(cl) / 1024, 1)
+            except requests.exceptions.Timeout:
+                res["missing_images"].append({
+                    "seite": url, "src": abs_src,
+                    "problem": "nicht erreichbar (timeout)",
+                    "schwere": "kritisch", "alt_text": alt,
+                    "dateigroesse_kb": "", "format": format_ext, "hinweis": ""
+                })
+                time.sleep(0.1); continue
+            except Exception as e:
+                res["missing_images"].append({
+                    "seite": url, "src": abs_src,
+                    "problem": f"nicht erreichbar ({e})",
+                    "schwere": "kritisch", "alt_text": alt,
+                    "dateigroesse_kb": "", "format": format_ext, "hinweis": ""
+                })
+                time.sleep(0.1); continue
+
+            # Kritisch: Bild existiert nicht
+            if status_img >= 400:
+                res["missing_images"].append({
+                    "seite": url, "src": abs_src,
+                    "problem": f"HTTP {status_img}",
+                    "schwere": "kritisch", "alt_text": alt,
+                    "dateigroesse_kb": dateigroesse_kb, "format": format_ext, "hinweis": ""
+                })
+                time.sleep(0.1); continue
+
+            # ── Informative Checks (schwere = "info") ──────────────────────
+            hinweise = []
+
+            if not alt:
+                hinweise.append("kein alt-Text")
+
+            if not width or not height:
+                hinweise.append("fehlendes width/height (CLS-Risiko)")
+
+            if loading != "lazy":
+                hinweise.append("kein loading=lazy")
+
+            if format_ext in ("jpg","jpeg","png","gif","bmp","tiff"):
+                hinweise.append(f"Format {format_ext.upper()} – WebP/AVIF wäre besser")
+
+            if dateigroesse_kb and dateigroesse_kb > 300:
+                hinweise.append(f"groß ({dateigroesse_kb} KB > 300 KB)")
+
+            if hinweise:
+                res["missing_images"].append({
+                    "seite": url, "src": abs_src,
+                    "problem": " | ".join(hinweise),
+                    "schwere": "info", "alt_text": alt,
+                    "dateigroesse_kb": dateigroesse_kb, "format": format_ext,
+                    "hinweis": "Nur zur Information – kein kritisches Problem"
+                })
+
             time.sleep(0.1)
 
     res["duplicate_titles"] = {k: v for k,v in res["duplicate_titles"].items() if len(v)>1}
@@ -233,28 +354,83 @@ def crawl_website(base_url, session):
     return res
 
 
-# ── CSV-Export der Broken Links ───────────────────────────────────────────────
+# ── CSV-Export ────────────────────────────────────────────────────────────────
 
-def export_broken_links_csv(broken_links, domain):
-    """Speichert alle Broken Links als CSV-Datei. Gibt den Dateinamen zurück."""
-    if not broken_links:
-        return None
-    fname = f"broken_links_{domain}_{datetime.now().strftime('%Y%m%d')}.csv".replace("/","_")
-    with open(fname, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["url", "status", "gefunden_auf"])
-        writer.writeheader()
-        for bl in broken_links:
-            writer.writerow({"url": bl["url"], "status": bl["status"], "gefunden_auf": bl.get("source","")})
-    print(f"💾 CSV gespeichert: {fname} ({len(broken_links)} Einträge)")
-    return fname
+def export_csvs(crawl, domain):
+    """
+    Exportiert alle Listen mit > CSV_THRESHOLD Einträgen als eigene CSV-Datei.
+    Gibt ein Dict {kategorie: dateiname} zurück.
+    """
+    date = datetime.now().strftime("%Y%m%d")
+    d = domain.replace("/","_").replace(":","")
+    files = {}
+
+    def maybe_csv(key, rows, fieldnames, label):
+        if len(rows) > CSV_THRESHOLD:
+            fname = f"{d}_{date}_{key}.csv"
+            write_csv(fname, rows, fieldnames)
+            files[label] = (fname, len(rows))
+
+    maybe_csv("broken_links", crawl["broken_links"],
+              ["url","status","gefunden_auf"], "Broken Links")
+
+    maybe_csv("broken_images",
+              [r for r in crawl["missing_images"] if r.get("schwere") == "kritisch"],
+              ["seite","src","problem","dateigroesse_kb","format","alt_text"],
+              "Defekte Bilder")
+
+    maybe_csv("image_optimierung",
+              [r for r in crawl["missing_images"] if r.get("schwere") == "info"],
+              ["seite","src","problem","dateigroesse_kb","format","alt_text","hinweis"],
+              "Bild-Optimierungspotenzial")
+
+    maybe_csv("slow_pages", crawl["slow_pages"],
+              ["url","ladezeit_ms"], "Langsame Seiten")
+
+    maybe_csv("missing_meta", crawl["missing_meta"],
+              ["url","fehlt"], "Fehlende Meta-Tags")
+
+    maybe_csv("missing_h1", crawl["missing_h1"],
+              ["url"], "Seiten ohne H1")
+
+    maybe_csv("multiple_h1", crawl["multiple_h1"],
+              ["url","anzahl_h1","texte"], "Mehrere H1-Tags")
+
+    maybe_csv("missing_canonical", crawl["missing_canonical"],
+              ["url"], "Fehlende Canonical-Tags")
+
+    maybe_csv("missing_schema", crawl["missing_schema"],
+              ["url"], "Fehlendes Schema-Markup")
+
+    maybe_csv("missing_og", crawl["missing_og_tags"],
+              ["url","fehlt"], "Fehlende OG-Tags")
+
+    maybe_csv("mixed_content", crawl["mixed_content"],
+              ["seite","ressource","typ"], "Mixed Content")
+
+    maybe_csv("redirect_chains", crawl["redirect_chains"],
+              ["url","final_url","hops","zwischenstopps"], "Redirect-Chains")
+
+    maybe_csv("noindex_pages", crawl["noindex_pages"],
+              ["url","robots_content"], "noindex-Seiten")
+
+    # Duplikate flach aufbereiten
+    dup_title_rows = [{"titel": t, "anzahl": len(urls), "urls": " | ".join(urls)} for t,urls in crawl["duplicate_titles"].items()]
+    maybe_csv("duplicate_titles", dup_title_rows,
+              ["titel","anzahl","urls"], "Doppelte Titles")
+
+    dup_desc_rows = [{"beschreibung": d[:80], "anzahl": len(urls), "urls": " | ".join(urls)} for d,urls in crawl["duplicate_descs"].items()]
+    maybe_csv("duplicate_descs", dup_desc_rows,
+              ["beschreibung","anzahl","urls"], "Doppelte Descriptions")
+
+    return files
 
 
 # ── Claude-Analyse ────────────────────────────────────────────────────────────
 
-def analyze_with_claude(crawl, ssl_r, headers_r, https_r, pagespeed_r, infra_r, target_url):
+def analyze_with_claude(crawl, ssl_r, headers_r, https_r, pagespeed_r, infra_r, target_url, csv_files):
     pages = crawl["pages"]
     load_times = [p["load_ms"] for p in pages.values() if p["load_ms"] > 0]
-    broken_count = len(crawl["broken_links"])
 
     summary = {
         "website": target_url,
@@ -262,14 +438,16 @@ def analyze_with_claude(crawl, ssl_r, headers_r, https_r, pagespeed_r, infra_r, 
         "pages_crawled": crawl["total_pages_crawled"],
         "performance": {
             "avg_load_ms": int(sum(load_times)/len(load_times)) if load_times else 0,
-            "slow_pages": crawl["slow_pages"],
+            "slow_pages_count": len(crawl["slow_pages"]),
+            "slow_pages_sample": crawl["slow_pages"][:3],
             "pagespeed": pagespeed_r,
         },
         "ssl": ssl_r,
         "https_redirect": https_r,
         "security_headers": {"score": headers_r.get("score",0), "max": headers_r.get("max",6), "missing": headers_r.get("missing",[])},
         "mixed_content_count": len(crawl["mixed_content"]),
-        "broken_links_count": broken_count,
+        "broken_links_count": len(crawl["broken_links"]),
+        "broken_links_sample": crawl["broken_links"][:5],
         "redirect_chains_count": len(crawl["redirect_chains"]),
         "seo": {
             "missing_meta_count": len(crawl["missing_meta"]),
@@ -282,21 +460,37 @@ def analyze_with_claude(crawl, ssl_r, headers_r, https_r, pagespeed_r, infra_r, 
             "missing_og_count": len(crawl["missing_og_tags"]),
             "missing_schema_count": len(crawl["missing_schema"]),
         },
-        "images_issues_count": len(crawl["missing_images"]),
+        "images": {
+            "broken_count":       len([i for i in crawl["missing_images"] if i.get("schwere") == "kritisch"]),
+            "optimierung_count":  len([i for i in crawl["missing_images"] if i.get("schwere") == "info"]),
+            "kein_alt_count":     len([i for i in crawl["missing_images"] if "kein alt-Text" in i.get("problem","")]),
+            "falsches_format":    len([i for i in crawl["missing_images"] if "Format" in i.get("problem","")]),
+            "zu_gross":           len([i for i in crawl["missing_images"] if "KB >" in i.get("problem","")]),
+            "kein_lazy":          len([i for i in crawl["missing_images"] if "loading=lazy" in i.get("problem","")]),
+            "kein_cls_attrs":     len([i for i in crawl["missing_images"] if "width/height" in i.get("problem","")]),
+            "hinweis": "Optimierungen sind informativ, keine kritischen Probleme",
+        },
         "infrastructure": infra_r,
+        "csvs_erstellt": [f"{label} ({cnt} Einträge)" for label,(fname,cnt) in csv_files.items()],
     }
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     domain = urlparse(target_url).netloc
+
+    csv_hinweis = ""
+    if csv_files:
+        csv_liste = "\n".join(f"• {label}: {cnt} Einträge" for label,(fname,cnt) in csv_files.items())
+        csv_hinweis = f"\n\nFolgende Kategorien wurden als CSV in GitHub Artifacts gespeichert:\n{csv_liste}"
+
     prompt = f"""Du bist ein Website-Analyst. Erstelle einen kompakten Slack-Report auf Deutsch.
 
 {json.dumps(summary, indent=2, ensure_ascii=False)}
 
-Wichtige Regeln:
-- Security Headers = NUR kurze Info-Zeile, KEINE Kritisch-Einstufung
-- Broken Links: NUR die Anzahl nennen ({broken_count}) – die vollständige Liste ist als CSV-Datei in GitHub verfügbar
-- Kritisch = nur: Broken Links vorhanden, SSL <14 Tage, HTTPS fehlt, noindex auf wichtigen Seiten
-- Report MUSS unter 2500 Zeichen bleiben (Slack-Limit!)
+Regeln:
+- Security Headers = NUR kurze Info-Zeile, keine Kritisch-Einstufung
+- Bei Kategorien mit CSV: nur Anzahl nennen, kein Aufzählen der URLs
+- Kritisch = nur: Broken Links, SSL <14 Tage, HTTPS fehlt, noindex auf wichtigen Seiten
+- Report MUSS unter 2500 Zeichen bleiben
 
 Struktur:
 *🔴/🟡/🟢 {domain} – Gesamtstatus*
@@ -309,11 +503,15 @@ Ein Satz.
 • ...
 
 *📊 Performance*
-• Ø Ladezeit: Xms | Langsamste: URL (Xms)
+• Ø Ladezeit: Xms | Langsamste Seiten: X über {SLOW_PAGE_MS}ms
 • PageSpeed Mobile: X/100 | Desktop: X/100
 
 *📝 SEO*
-• Titles/Desc fehlen: X | H1 fehlt: X | Kein Schema: X
+• Titles/Desc fehlen: X | H1 fehlt: X | Kein Schema: X | Kein Canonical: X
+
+*🖼️ Bilder*
+• Defekt (kritisch): X
+• Optimierungspotenzial (nur Info): kein Alt-Text X | Format X | >300KB X | kein lazy X | kein width/height X
 
 *ℹ️ Security Headers*
 • X/6 gesetzt
@@ -331,12 +529,12 @@ Kurz, klar, unter 2500 Zeichen!
         max_tokens=1000,
         messages=[{"role": "user", "content": prompt}]
     )
-    return resp.content[0].text, summary
+    return resp.content[0].text, summary, csv_hinweis
 
 
 # ── Slack ─────────────────────────────────────────────────────────────────────
 
-def send_to_slack(report_text, summary, broken_links, target_url, csv_filename):
+def send_to_slack(report_text, summary, csv_files, csv_hinweis, target_url):
     if not SLACK_WEBHOOK_URL:
         print("⚠️  Kein SLACK_WEBHOOK_URL – Report im Terminal:")
         print(report_text)
@@ -348,20 +546,17 @@ def send_to_slack(report_text, summary, broken_links, target_url, csv_filename):
             "#ff9800" if ssl_days < SSL_WARN_DAYS else "#2eb886"
     domain = urlparse(target_url).netloc
 
-    # Broken-Links-Block: Link zur GitHub-Actions-CSV
-    if broken_count > 0 and csv_filename:
-        broken_block = (
-            f"\n\n*🔗 {broken_count} Broken Link{'s' if broken_count != 1 else ''} gefunden*\n"
-            f"Vollständige Liste als CSV-Datei: <{GITHUB_RUN_URL}|GitHub Actions → Artifacts öffnen>"
+    # CSV-Block anhängen falls vorhanden
+    artifacts_block = ""
+    if csv_files:
+        artifacts_block = (
+            f"\n\n*📁 Detailreports als CSV verfügbar*\n"
+            + "\n".join(f"• {label}: {cnt} Einträge" for label,(fname,cnt) in csv_files.items())
+            + f"\n→ <{GITHUB_RUN_URL}|GitHub Actions → Artifacts öffnen>"
         )
-    elif broken_count > 0:
-        broken_block = f"\n\n*🔗 {broken_count} Broken Links gefunden* (Details im Log)"
-    else:
-        broken_block = ""
 
-    # Report auf maximal 2500 Zeichen kürzen
-    max_report = 2500 - len(broken_block)
-    final_text = report_text[:max_report] + broken_block
+    max_report = 2800 - len(artifacts_block)
+    final_text = report_text[:max_report] + artifacts_block
 
     payload = {
         "attachments": [{
@@ -374,7 +569,7 @@ def send_to_slack(report_text, summary, broken_links, target_url, csv_filename):
                 {"type": "context", "elements": [{"type": "mrkdwn", "text": (
                     f"📄 {summary['pages_crawled']} Seiten  •  "
                     f"🔗 {broken_count} Broken Links  •  "
-                    f"🐢 {len(summary['performance']['slow_pages'])} langsam  •  "
+                    f"🐢 {summary['performance']['slow_pages_count']} langsam  •  "
                     f"🔐 SSL: {ssl_days} Tage  •  "
                     f"{summary['crawl_date']}"
                 )}]}
@@ -405,17 +600,22 @@ def check_one_site(target_url):
     print("🗺️  Infra...");       infra_r     = check_robots_and_sitemap(target_url, session)
     print(f"🔍 Crawle...");      crawl_r     = crawl_website(target_url, session)
 
-    broken = crawl_r["broken_links"]
-    print(f"   {crawl_r['total_pages_crawled']} Seiten | {len(broken)} Broken Links | {len(crawl_r['slow_pages'])} langsam")
+    bl = len(crawl_r["broken_links"])
+    sl = len(crawl_r["slow_pages"])
+    im = len(crawl_r["missing_images"])
+    print(f"   {crawl_r['total_pages_crawled']} Seiten | {bl} Broken Links | {sl} langsam | {im} Bild-Probleme")
 
-    # Broken Links als CSV speichern
-    csv_file = export_broken_links_csv(broken, domain)
+    print("📁 Exportiere CSVs...")
+    csv_files = export_csvs(crawl_r, domain)
+    if not csv_files:
+        print("   (alle Listen unter Schwellenwert, keine CSVs nötig)")
 
     print("🤖 Claude...")
-    report_text, summary = analyze_with_claude(crawl_r, ssl_r, headers_r, https_r, pagespeed_r, infra_r, target_url)
+    report_text, summary, csv_hinweis = analyze_with_claude(
+        crawl_r, ssl_r, headers_r, https_r, pagespeed_r, infra_r, target_url, csv_files)
 
     print("📤 Slack...")
-    send_to_slack(report_text, summary, broken, target_url, csv_file)
+    send_to_slack(report_text, summary, csv_files, csv_hinweis, target_url)
 
     if os.environ.get("SAVE_REPORT"):
         fname = f"report_{domain}_{datetime.now().strftime('%Y%m%d_%H%M')}.json".replace("/","_")
